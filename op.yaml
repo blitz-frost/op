@@ -1,0 +1,21 @@
+routes:
+  build:
+    procs:
+    - path: go
+      args: [build, -o, op, "${BLITZ}/op/main"]
+      env:
+        GOPATH: ${GOPATH}
+        HOME: ${HOME}
+      err: std
+  deploy:
+    procs:
+    - path: cp
+      args: ["${PWD}/op", "${GOBIN}/op_new"]
+    - path: mv
+      args: ["${GOBIN}/op_new", "${GOBIN}/op"]
+  test:
+    default: true
+    procs:
+    - path: echo
+      args: [prooost]
+      out: std
