@@ -45,10 +45,18 @@ A route may have a "default" bool attribute to indicate if it should be run when
 At any point in the configuration file. Env markers may be placed, of the form ${NAME}. File will be preprocessed to replace each such marker with the value of the corresponding env, as seen by the op program itself.
 To keep the literal "${string}" in the file, it must be escaped using a backslash ("\\${string}").
 
+Any level of the configuration (top/route/process) may have a "var" field. This must be a string value map, similar to "env".
+These variables may then be referenced in any string field within the same scope, using the Go template syntax. Notably, in the context of yaml, they must be used inside quoted strings.
+As with envs, inner var declarations have priority over higher level ones.
+Vars are evaluated and applied after env expansion.
+
 Example op.yaml file:
 ```text
+var:
+  a: somestring
 env:
   HOME: ${HOME}
+  A: "{{.a}}"
 routes:
   route0:
     default: true
@@ -56,7 +64,7 @@ routes:
       HOME: somepath
     procs:
     - path: someprogram
-      args: [somearg, anotherarg]
+      args: [somearg, anotherarg, "a={{.a}}"]
       env:
         HOME: someotherpath
         FOO: bar

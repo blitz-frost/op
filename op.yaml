@@ -16,6 +16,8 @@ routes:
   test:
     default: true
     procs:
-    - path: echo
-      args: [prooost]
+    - path: ./op
+      env:
+        OP: op_test.yaml
       out: std
+      err: std

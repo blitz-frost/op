@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -185,24 +186,54 @@ func isNotRun(s string) bool {
 
 // A Proc holds the information necessary to execute a process.
 type Proc struct {
+	Var  map[string]string
+	Env  map[string]string
 	Name string
 	Path string
 	Dir  string
-	Env  map[string]string
 	Args []string
 	Out  string
 	Err  string
 }
 
+// interpret applies x.Var to the other members.
+func (x *Proc) interpret() error {
+	if err := interpretMap(x.Env, x.Var); err != nil {
+		return err
+	}
+	if err := interpretSlice(x.Args, x.Var); err != nil {
+		return err
+	}
+	if err := interpret(&x.Name, x.Var); err != nil {
+		return err
+	}
+	if err := interpret(&x.Path, x.Var); err != nil {
+		return err
+	}
+	if err := interpret(&x.Dir, x.Var); err != nil {
+		return err
+	}
+	if err := interpret(&x.Out, x.Var); err != nil {
+		return err
+	}
+	if err := interpret(&x.Err, x.Var); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // A Route holds information relevant to a single execution route.
 type Route struct {
 	Default bool              // will run on no-argument forms
-	Env     map[string]string // route-wide env
+	Var     map[string]string // route-scope var
+	Env     map[string]string // route-scope env
 	Procs   []Proc            // process configurations
 }
 
 // A Manifest holds routes and their individual process configs.
 type Manifest struct {
+	Var    map[string]string
 	Env    map[string]string
 	Routes map[string]Route
 }
@@ -366,40 +397,78 @@ func DecodeConfig() (map[string]Route, error) {
 		return nil, fmt.Errorf("config parse error: %w", err)
 	}
 
+	// apply vars in top level fields
+	if err := interpretMap(x.Env, x.Var); err != nil {
+		return nil, err
+	}
+
 	// roll out env declarations from top to bottom
 	// bottom has priority
-	routeMap := x.Routes
-	for _, route := range routeMap {
-		// merge route env with global env
-		routeEnv := route.Env
-		if routeEnv == nil {
-			if x.Env == nil {
-				continue // if both route and global env are empty, nothing needs to be done
-			}
-			routeEnv = x.Env
-		} else {
-			for k, v := range x.Env {
-				if _, ok := routeEnv[k]; !ok {
-					routeEnv[k] = v
-				}
-			}
+	for _, route := range x.Routes {
+		merge(&route.Var, x.Var)
+		merge(&route.Env, x.Env)
+		if err := interpretMap(route.Env, x.Var); err != nil {
+			return nil, err
 		}
 
 		procMap := route.Procs
-		for procKey, proc := range procMap {
-			// merge proc env with route env
-			envMap := proc.Env
-			if envMap == nil {
-				envMap = make(map[string]string)
-				procMap[procKey].Env = envMap
-			}
-			for k, v := range routeEnv {
-				if _, ok := envMap[k]; !ok {
-					envMap[k] = v
-				}
+		for _, proc := range procMap {
+			merge(&proc.Var, route.Var)
+			merge(&proc.Env, route.Env)
+			if err := proc.interpret(); err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	return x.Routes, nil
+}
+
+func interpretMap(s map[string]string, m map[string]string) error {
+	for k, v := range s {
+		if err := interpret(&v, m); err != nil {
+			return err
+		}
+		s[k] = v
+	}
+	return nil
+}
+
+func interpretSlice(s []string, m map[string]string) error {
+	for i := range s {
+		if err := interpret(&s[i], m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// interpret parses the string s points to as a template, and replaces it with the result of executing this template on m.
+func interpret(s *string, m map[string]string) error {
+	tmpl, err := template.New("").Parse(*s)
+	if err != nil {
+		return err
+	}
+
+	b := &strings.Builder{}
+	if err := tmpl.Execute(b, m); err != nil {
+		return err
+	}
+	*s = b.String()
+
+	return nil
+}
+
+// merge copies the keys from src into dst. Keys that already exist in dst preserve their value.
+// If dst points to a nil map, it will be allocated.
+func merge(dst *map[string]string, src map[string]string) {
+	if *dst == nil {
+		*dst = make(map[string]string)
+	}
+	m := *dst
+	for k, v := range src {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
 }
