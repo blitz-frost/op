@@ -3,7 +3,7 @@ routes:
   build:
     procs:
     - path: go
-      args: [build, -o, op, "${PWD}/op/main"]
+      args: [build, -o, op, "${PWD}/main"]
       env:
         GOPATH: ${GOPATH}
         HOME: ${HOME}
