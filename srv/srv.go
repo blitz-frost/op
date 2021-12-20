@@ -133,9 +133,11 @@ type proc struct {
 	cmd *exec.Cmd
 
 	// config values, to use on restart
+	inCfg  string
 	outCfg string
 	errCfg string
 
+	inPipe  procPipe
 	outPipe procPipe
 	errPipe procPipe
 }
@@ -159,6 +161,22 @@ func newProc(ctx context.Context, route string, cfg config) (x *proc, err error)
 	cmd.Env = env
 
 	prefix := []byte(route + "|" + cfg.Name + ": ")
+
+	// setup stdin funnel
+	var inPipe procPipe
+	if cfg.In != "" {
+		inPipe.dst, err = cmd.StdinPipe()
+		if err != nil {
+			errStr = "stdin"
+			return
+		}
+
+		inPipe.src, err = os.Open(cfg.In)
+		if err != nil {
+			errStr = "in file"
+			return
+		}
+	}
 
 	// setup stdout collection
 	var outPipe procPipe
@@ -206,8 +224,10 @@ func newProc(ctx context.Context, route string, cfg config) (x *proc, err error)
 		cancel:  cancel,
 		done:    ctx.Done(),
 		cmd:     cmd,
+		inCfg:   cfg.In,
 		outCfg:  cfg.Out,
 		errCfg:  cfg.Err,
+		inPipe:  inPipe,
 		outPipe: outPipe,
 		errPipe: errPipe,
 	}, nil
@@ -218,6 +238,16 @@ func (x *proc) run() error {
 	if err := x.cmd.Start(); err != nil {
 		return fmt.Errorf("start error: %w", err)
 	}
+
+	// funnel input
+	go func() {
+		if err := x.inPipe.run(); err != nil && err != io.EOF {
+			stderr.Println(x.name+" stdin read error:", err)
+		}
+		if x.inPipe.dst != nil {
+			x.inPipe.dst.(io.Closer).Close()
+		}
+	}()
 
 	// must read stdout and stderr before cmd.Wait()
 	wg := sync.WaitGroup{}
@@ -245,6 +275,9 @@ func (x *proc) run() error {
 		case err = <-chExit:
 			x.cancel() // release context
 		case <-x.done:
+			if x.inPipe.dst != nil {
+				x.inPipe.dst.(io.Closer).Close() // some programs will not exit until stdin is closed
+			}
 			x.cmd.Process.Signal(os.Interrupt)
 			t := time.AfterFunc(10*time.Second, func() {
 				x.cmd.Process.Kill()
@@ -264,53 +297,89 @@ func (x *proc) run() error {
 
 var (
 	activeMux sync.Mutex
-	active    map[string]*route = make(map[string]*route)
+	active    map[string]map[string]*route = make(map[string]map[string]*route) // active routes, mapped by namespace and name
 )
 
-func activeAdd(rt *route) error {
+func activeGet(namespace, name string) (*route, bool) {
 	activeMux.Lock()
 	defer activeMux.Unlock()
-	if _, ok := active[rt.name]; ok {
-		return errors.New("already exists")
+
+	ns, ok := active[namespace]
+	if !ok {
+		return nil, ok
 	}
-	active[rt.name] = rt
-	return nil
+
+	o, ok := ns[name]
+	return o, ok
 }
 
-func activeGet(name string) (*route, bool) {
-	activeMux.Lock()
-	x, ok := active[name]
-	activeMux.Unlock()
-	return x, ok
-}
-
-// activeRange applies the given function to all active routes.
+// activeRange applies the given function to all active routes in a specific namespace.
 // Concurrent safe.
-func activeRange(fn func(*route)) {
+func activeRange(namespace string, fn func(*route)) {
 	activeMux.Lock()
 	defer activeMux.Unlock()
-	for _, rt := range active {
+	for _, rt := range active[namespace] {
 		activeMux.Unlock() // avoid deadlock if fn uses activeMux
 		fn(rt)
 		activeMux.Lock()
 	}
 }
 
-func activeRemove(name string) error {
+// activeRangeAll applies the given function to all active routes.
+// Concurrent safe.
+func activeRangeAll(fn func(*route)) {
 	activeMux.Lock()
 	defer activeMux.Unlock()
-	rt, ok := active[name]
+	for ns, _ := range active {
+		activeMux.Unlock() // avoid deadlock
+		activeRange(ns, fn)
+		activeMux.Lock()
+	}
+}
+
+func activeRemove(namespace, name string) error {
+	activeMux.Lock()
+	defer activeMux.Unlock()
+	ns, ok := active[namespace]
+	if !ok {
+		return errors.New("not an active namespace")
+	}
+	rt, ok := ns[name]
 	if !ok {
 		return errors.New("not an active route")
 	}
+
 	rt.cancel()
-	delete(active, name)
+	delete(ns, name)
+	if len(ns) == 0 {
+		delete(active, namespace)
+	}
+
+	return nil
+}
+
+func activeSet(rt *route) error {
+	activeMux.Lock()
+	defer activeMux.Unlock()
+
+	ns, ok := active[rt.namespace]
+	if !ok {
+		ns = make(map[string]*route)
+		active[rt.namespace] = ns
+	}
+
+	if _, ok := ns[rt.name]; ok {
+		return errors.New("already exists")
+	}
+
+	ns[rt.name] = rt
 	return nil
 }
 
 type route struct {
-	name  string
-	tasks []config
+	namespace string
+	name      string
+	tasks     []config
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -320,7 +389,7 @@ type route struct {
 	active string     // currently active process name
 }
 
-func newRoute(ctx context.Context, name string, cfgs []lib.Proc, wout, werr io.Writer) *route {
+func newRoute(ctx context.Context, namespace, name string, cfgs []lib.Proc, wout, werr io.Writer) *route {
 	// wrap raw configs
 	// autofill names if absent: process number in route, starting from 0
 	tasks := make([]config, len(cfgs))
@@ -336,11 +405,12 @@ func newRoute(ctx context.Context, name string, cfgs []lib.Proc, wout, werr io.W
 	rtCtx, cfn := context.WithCancel(ctx)
 
 	return &route{
-		name:   name,
-		tasks:  tasks,
-		ctx:    rtCtx,
-		cancel: cfn,
-		done:   make(chan struct{}),
+		namespace: namespace,
+		name:      name,
+		tasks:     tasks,
+		ctx:       rtCtx,
+		cancel:    cfn,
+		done:      make(chan struct{}),
 	}
 }
 
@@ -357,12 +427,12 @@ func (x *route) activeSet(name string) {
 }
 
 func (x *route) run() error {
-	if err := activeAdd(x); err != nil {
+	if err := activeSet(x); err != nil {
 		return err
 	}
 
 	defer func() {
-		activeRemove(x.name)
+		activeRemove(x.namespace, x.name)
 		close(x.done)
 		x.cancel()
 	}()
@@ -421,14 +491,14 @@ func (x command) executeExit() {
 // Waits for termination.
 func (x command) executeKill() {
 	if x.Route != "" {
-		if rt, ok := activeGet(x.Route); ok {
+		if rt, ok := activeGet(x.Namespace, x.Route); ok {
 			rt.cancel()
 			<-rt.done
 		}
 		return
 	}
 
-	activeRange(func(rt *route) {
+	activeRange(x.Namespace, func(rt *route) {
 		rt.cancel()
 		<-rt.done
 	})
@@ -443,7 +513,7 @@ func (x command) executeList() {
 	}()
 
 	if x.Route != "" {
-		rt, ok := activeGet(x.Route)
+		rt, ok := activeGet(x.Namespace, x.Route)
 		if !ok {
 			return
 		}
@@ -451,7 +521,7 @@ func (x command) executeList() {
 		return
 	}
 
-	activeRange(func(rt *route) {
+	activeRange(x.Namespace, func(rt *route) {
 		r = append(r, rt.String()...)
 		r = append(r, '\n')
 	})
@@ -508,7 +578,7 @@ func (x command) executeRun() error {
 	for name, route := range manifest {
 		wg.Add(1)
 		go func(name string, cfgs []lib.Proc) {
-			rt := newRoute(x.ctx, name, cfgs, x.stdout, x.stderr)
+			rt := newRoute(x.ctx, route.Namespace, name, cfgs, x.stdout, x.stderr)
 			if err := rt.run(); err != nil {
 				stderr.Println(name+" error:", err)
 			}
@@ -719,10 +789,11 @@ func Run() {
 
 		cmd := command{
 			Cmd: lib.Cmd{
-				Sw:     "",
-				Route:  lib.ArgMajor,
-				Proc:   lib.ArgMinor,
-				Config: conf,
+				Sw:        "",
+				Namespace: conf.Namespace,
+				Route:     lib.ArgMajor,
+				Proc:      lib.ArgMinor,
+				Config:    conf.Routes,
 			},
 			stdout: stdout,
 			stderr: stderr,

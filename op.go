@@ -22,12 +22,12 @@ func Run() {
 			fmt.Println(err)
 			return
 		}
-		for name, rt := range manifest {
+		for name, rt := range manifest.Routes {
 			s := ""
 			if rt.Default {
 				s = " - default"
 			}
-			fmt.Println(name + s)
+			fmt.Println(rt.Namespace + ": " + name + s)
 		}
 		return
 

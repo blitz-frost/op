@@ -100,10 +100,11 @@ func Run() {
 
 	// encode and send command
 	cmd := lib.Cmd{
-		Sw:     lib.ArgSwitch,
-		Route:  lib.ArgMajor,
-		Proc:   lib.ArgMinor,
-		Config: conf,
+		Sw:        lib.ArgSwitch,
+		Namespace: conf.Namespace,
+		Route:     lib.ArgMajor,
+		Proc:      lib.ArgMinor,
+		Config:    conf.Routes,
 	}
 	if err := sendCmd(cmd); err != nil {
 		stderr.Println("command send error:", err)

@@ -15,12 +15,12 @@ import (
 )
 
 var (
-	BasePath     string           // general pipe directory
-	LockPath     string           // server lock file
-	ConfigPath   string           // config file path
-	TemplatePath string           // template file path
-	MetaPath     string           // meta file path
-	Port         string = ":2048" // server port
+	BasePath     string // general pipe directory
+	LockPath     string // server lock file
+	ConfigPath   string // config file path
+	TemplatePath string // template file path
+	MetaPath     string // meta file path
+	Port         string // server port
 )
 
 var (
@@ -30,12 +30,21 @@ var (
 )
 
 func init() {
-	uid := os.Getuid()
-	BasePath = "/run/user/" + strconv.Itoa(uid) + "/op"
-	if err := os.Mkdir(BasePath, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-		fmt.Println("base path make error:", err)
-		os.Exit(1)
+	Port = os.Getenv("OP_PORT")
+	if Port == "" {
+		Port = ":2048"
 	}
+
+	BasePath = os.Getenv("OP_WORKDIR")
+	if BasePath == "" {
+		uid := os.Getuid()
+		BasePath = "/run/user/" + strconv.Itoa(uid) + "/op"
+		if err := os.Mkdir(BasePath, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			fmt.Println("base path make error:", err)
+			os.Exit(1)
+		}
+	}
+
 	LockPath = BasePath + "/lock"
 
 	parseArgs()
@@ -74,7 +83,7 @@ func parseArgs() {
 
 	// if global switch is present, use global manifest
 	if _, ok := m[CmdGlobal]; ok {
-		ConfigPath = os.Getenv("OPGLOBAL")
+		ConfigPath = os.Getenv("OP_GLOBAL")
 		delete(m, CmdGlobal)
 	} else {
 		ConfigPath = os.Getenv("OP")
@@ -192,6 +201,7 @@ type Proc struct {
 	Path string
 	Dir  string
 	Args []string
+	In   string
 	Out  string
 	Err  string
 }
@@ -225,21 +235,24 @@ func (x *Proc) interpret() error {
 
 // A Route holds information relevant to a single execution route.
 type Route struct {
-	Default bool              // will run on no-argument forms
-	Var     map[string]string // route-scope var
-	Env     map[string]string // route-scope env
-	Procs   []Proc            // process configurations
+	Default   bool              // will run on no-argument forms
+	Namespace string            // route-scope namespace
+	Var       map[string]string // route-scope var
+	Env       map[string]string // route-scope env
+	Procs     []Proc            // process configurations
 }
 
 // A Manifest holds routes and their individual process configs.
 type Manifest struct {
-	Var    map[string]string
-	Env    map[string]string
-	Routes map[string]Route
+	Namespace string
+	Var       map[string]string
+	Env       map[string]string
+	Routes    map[string]Route
 }
 
 func MakeManifest() Manifest {
 	return Manifest{
+		Var:    make(map[string]string),
 		Env:    make(map[string]string),
 		Routes: make(map[string]Route),
 	}
@@ -247,10 +260,11 @@ func MakeManifest() Manifest {
 
 // Cmd represents an op program command
 type Cmd struct {
-	Sw     CmdSwitch        // command switch
-	Route  string           // target route
-	Proc   string           // target proc
-	Config map[string]Route // manifest to use for command; may be nil for commands that don't need it
+	Sw        CmdSwitch        // command switch
+	Namespace string           // target namespace
+	Route     string           // target route
+	Proc      string           // target proc
+	Config    map[string]Route // manifest to use for command; may be nil for commands that don't need it
 }
 
 type Meta struct {
@@ -381,47 +395,60 @@ func expandEnv(b []byte) []byte {
 }
 
 // DecodeConfig returns the manifest found at config path ("op.yaml" by default).
-func DecodeConfig() (map[string]Route, error) {
+func DecodeConfig() (Manifest, error) {
 	// read manifest
 	b0, err := os.ReadFile(ConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("config open error: %w", err)
+		return Manifest{}, fmt.Errorf("config open error: %w", err)
 	}
 
-	// variable expansion
 	b := expandEnv(b0)
 
 	// decode manifest
 	x := Manifest{}
 	if err := yaml.Unmarshal(b, &x); err != nil {
-		return nil, fmt.Errorf("config parse error: %w", err)
+		return Manifest{}, fmt.Errorf("config parse error: %w", err)
 	}
 
 	// apply vars in top level fields
 	if err := interpretMap(x.Env, x.Var); err != nil {
-		return nil, err
+		return Manifest{}, err
 	}
 
-	// roll out env declarations from top to bottom
+	// roll out scope declarations from top to bottom
 	// bottom has priority
-	for _, route := range x.Routes {
-		merge(&route.Var, x.Var)
-		merge(&route.Env, x.Env)
-		if err := interpretMap(route.Env, x.Var); err != nil {
-			return nil, err
+	for rt, route := range x.Routes {
+		route.Var = merge(route.Var, x.Var)
+
+		route.Env = merge(route.Env, x.Env)
+		if err := interpretMap(route.Env, route.Var); err != nil {
+			return Manifest{}, err
 		}
 
-		procMap := route.Procs
-		for _, proc := range procMap {
-			merge(&proc.Var, route.Var)
-			merge(&proc.Env, route.Env)
-			if err := proc.interpret(); err != nil {
-				return nil, err
-			}
+		if route.Namespace == "" {
+			route.Namespace = x.Namespace
 		}
+		if err := interpret(&route.Namespace, route.Var); err != nil {
+			return Manifest{}, err
+		}
+		if route.Namespace == "" {
+			route.Namespace = "default"
+		}
+
+		for p, proc := range route.Procs {
+			proc.Var = merge(proc.Var, route.Var)
+			proc.Env = merge(proc.Env, route.Env)
+			if err := proc.interpret(); err != nil {
+				return Manifest{}, err
+			}
+
+			route.Procs[p] = proc
+		}
+
+		x.Routes[rt] = route
 	}
 
-	return x.Routes, nil
+	return x, nil
 }
 
 func interpretMap(s map[string]string, m map[string]string) error {
@@ -460,15 +487,15 @@ func interpret(s *string, m map[string]string) error {
 }
 
 // merge copies the keys from src into dst. Keys that already exist in dst preserve their value.
-// If dst points to a nil map, it will be allocated.
-func merge(dst *map[string]string, src map[string]string) {
-	if *dst == nil {
-		*dst = make(map[string]string)
+// Returns the resulting map (useful when dst is nil).
+func merge(dst map[string]string, src map[string]string) map[string]string {
+	if dst == nil {
+		dst = make(map[string]string)
 	}
-	m := *dst
 	for k, v := range src {
-		if _, ok := m[k]; !ok {
-			m[k] = v
+		if _, ok := dst[k]; !ok {
+			dst[k] = v
 		}
 	}
+	return dst
 }

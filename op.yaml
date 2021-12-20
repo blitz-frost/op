@@ -1,8 +1,9 @@
+namespace: op
 routes:
   build:
     procs:
     - path: go
-      args: [build, -o, op, "${BLITZ}/op/main"]
+      args: [build, -o, op, "${PWD}/op/main"]
       env:
         GOPATH: ${GOPATH}
         HOME: ${HOME}
@@ -15,9 +16,9 @@ routes:
       args: ["${GOBIN}/op_new", "${GOBIN}/op"]
   test:
     default: true
+    env:
+      OP: op_test.yaml
     procs:
     - path: ./op
-      env:
-        OP: op_test.yaml
       out: std
       err: std

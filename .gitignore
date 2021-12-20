@@ -1,0 +1,5 @@
+*.swp
+op
+op_test.yaml
+op_meta.yaml
+op_template.yaml
