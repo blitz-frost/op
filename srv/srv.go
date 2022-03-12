@@ -577,13 +577,13 @@ func (x command) executeRun() error {
 	wg := sync.WaitGroup{}
 	for name, route := range manifest {
 		wg.Add(1)
-		go func(name string, cfgs []lib.Proc) {
-			rt := newRoute(x.ctx, route.Namespace, name, cfgs, x.stdout, x.stderr)
+		go func(namespace, name string, cfgs []lib.Proc) {
+			rt := newRoute(x.ctx, namespace, name, cfgs, x.stdout, x.stderr)
 			if err := rt.run(); err != nil {
 				stderr.Println(name+" error:", err)
 			}
 			wg.Done()
-		}(name, route.Procs)
+		}(route.Namespace, name, route.Procs)
 	}
 	wg.Wait()
 
@@ -642,7 +642,7 @@ func clean(id byte) {
 // serve uses the appropriate pipes to listen for a new client's requests, and respond to them
 func serve(id byte) {
 	done := mainCtx.Done()
-	pipesOpen := make(chan error)
+	pipesOpen := make(chan error, 1)
 
 	var inPipe, outPipe, errPipe *os.File
 	defer func() { // in case any pipe are left open
@@ -654,6 +654,8 @@ func serve(id byte) {
 	paths := lib.PipePaths(id)
 	r := make([]byte, 1) // used to read from input to see when it closes
 
+	// open pipes concurrently to avoid blocking forever in case of abortion
+	// OpenFile functions should return when the pipes get closed
 	go func() {
 		var err error
 		inPipe, err = os.OpenFile(paths[0], os.O_RDONLY, os.ModeNamedPipe)
@@ -778,9 +780,10 @@ func Run() {
 	// functions as a server for other op processes until done
 	// if server switch is present, runs as dedicated server without executing anything
 	// any other switch is invalid
-	if lib.ArgSwitch == lib.CmdServer {
+	switch lib.ArgSwitch {
+	case lib.CmdServer:
 		<-cleanupDone
-	} else {
+	case lib.CmdRun:
 		conf, err := lib.DecodeConfig()
 		if err != nil {
 			stderr.Println("manifest decode error:", err)
@@ -789,7 +792,7 @@ func Run() {
 
 		cmd := command{
 			Cmd: lib.Cmd{
-				Sw:        "",
+				Sw:        lib.CmdRun,
 				Namespace: conf.Namespace,
 				Route:     lib.ArgMajor,
 				Proc:      lib.ArgMinor,

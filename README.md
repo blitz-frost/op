@@ -180,7 +180,7 @@ This is my first public repo, and as such I can't quite pronounce myself on the 
 Current\
 Proc input files, as well as namespaces, are the very recently added. Finding and fixing any bugs that this might have surfaced is the current priority.
 
-Future\
+Future
 - Provide more options for proc stdin and stdout linkage, other than temporary regular files\
 - Inter-route coordonation\
 - The ability for op to propagate itself and execute routes on other hosts
